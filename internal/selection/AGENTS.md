@@ -1,6 +1,6 @@
 # Task assessment and model selection
 
-Last verified: 2026-09-18
+Last verified: 2026-09-25
 
 ## Purpose
 
@@ -14,6 +14,7 @@ Keep probabilistic difficulty assessment separate from deterministic, quota-awar
 - Return exact registered references, preserve suffixes, and expose uncertainty. Headroom is neither reserved capacity nor comparable token counts.
 - Jev uses a fixed endpoint, trusted versioned rubric, bounded UTF-8 prompt and bounded response, cancellation, and no redirects or retries. Only task text is request state.
 - Credential resolution occurs only immediately before enabled remote requests. Reports/errors contain safe codes and validated numbers, never prompt/key/raw response or arbitrary upstream text.
+- `select-group` takes a caller-supplied, flattened Polytoken model group as JSON on stdin. It never reads Polytoken `modelgroups` config, because no authoritative resolver exists and the documented precedence disagrees with the binary. It picks in failover order (first confirmed, then first uncertain), and unregistered members are uncertain/`unmanaged`, never fatal.
 - CLI orchestration uses service snapshots and explicit quota checks without reconciliation. Target diagnostics do not invalidate independently usable selection inputs.
 
 ## Verification and adoption

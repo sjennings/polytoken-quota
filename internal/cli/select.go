@@ -257,6 +257,88 @@ func writeSelectText(w io.Writer, o selection.SelectOutcome) {
 	}
 }
 
+// --- select-group ---
+
+// runSelectGroup handles select-group [--exclude-family NAME]... [--refresh]
+// [--json] with the model-group request JSON on stdin.
+func runSelectGroup(ctx context.Context, args []string, deps Dependencies, stdin io.Reader, stdout, stderr io.Writer) int {
+	if hasHelpFlag(args) {
+		writeCommandHelp(stdout, "select-group")
+		return ExitOK
+	}
+	var req selection.GroupRequest
+	jsonOut := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--refresh":
+			req.RefreshFirst = true
+			continue
+		case "--json":
+			jsonOut = true
+			continue
+		}
+		name, value, found := flagValue(args, &i, args[i])
+		if !found || name != "--exclude-family" {
+			return groupFatal(stdout, stderr, jsonOut, "select-group: invalid arguments")
+		}
+		req.ExcludedFamilies = append(req.ExcludedFamilies, value)
+	}
+	raw, err := io.ReadAll(io.LimitReader(stdin, selection.MaxGroupBytes+1))
+	if err != nil {
+		return groupFatal(stdout, stderr, jsonOut, "select-group: read group request")
+	}
+	if req.Group, err = selection.ParseGroup(raw); err != nil {
+		return groupFatal(stdout, stderr, jsonOut, sanitizeMessage("select-group: "+err.Error()))
+	}
+	if deps.SelectGroup == nil {
+		return groupFatal(stdout, stderr, jsonOut, "select-group: selection is unavailable")
+	}
+	outcome, err := deps.SelectGroup.RunGroup(ctx, req)
+	if err != nil {
+		return groupFatal(stdout, stderr, jsonOut, selectFatalMessage(err))
+	}
+	if jsonOut {
+		encodeJSON(stdout, groupEnvelope(outcome))
+	} else {
+		writeGroupText(stdout, outcome)
+	}
+	return selectExitCode(outcome.Status)
+}
+
+func groupFatal(stdout, stderr io.Writer, jsonOut bool, msg string) int {
+	if jsonOut {
+		encodeJSON(stdout, groupOutcomeJSON{Version: selectJSONVersion, Status: selectStatusError, Members: []groupMemberJSON{}, Error: msg})
+		return ExitRejected
+	}
+	fmt.Fprintln(stderr, msg)
+	return ExitRejected
+}
+
+// writeGroupText renders the human select-group output: the verdict, then one
+// line per member in failover order.
+func writeGroupText(w io.Writer, o selection.GroupOutcome) {
+	fmt.Fprintf(w, "status: %s\n", o.Status)
+	fmt.Fprintf(w, "group: %s\n", sanitizeMessage(o.Group))
+	if o.Selected >= 0 {
+		fmt.Fprintf(w, "model: %s\n", sanitizeMessage(o.Members[o.Selected].Reference))
+	}
+	if !o.AsOf.IsZero() {
+		fmt.Fprintf(w, "as_of: %s\n", o.AsOf.UTC().Format(time.RFC3339))
+	}
+	fmt.Fprintln(w, "members:")
+	for i, m := range o.Members {
+		mark := " "
+		if i == o.Selected {
+			mark = "*"
+		}
+		line := fmt.Sprintf("%s %s  %s (%s)", mark, sanitizeMessage(m.Reference), m.Status, sanitizeMessage(m.Reason))
+		if m.Headroom != nil {
+			line += fmt.Sprintf(" headroom %.0f%%", *m.Headroom*100)
+		}
+		fmt.Fprintln(w, line)
+	}
+}
+
 // --- select-eval ---
 
 // runSelectEval handles select-eval --policy PATH --fixtures PATH --live

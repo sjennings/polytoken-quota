@@ -350,6 +350,72 @@ func selectEnvelope(o selection.SelectOutcome, errMsg string) selectOutcomeJSON 
 	return out
 }
 
+// groupOutcomeJSON is the normative select-group shape. model is null unless
+// a member was selected; members always lists every member in request order.
+//
+//	{"version":1,"status":"confirmed","reason":"fresh_quota_evidence",
+//	 "group":"fast","model":"codex/example(high)","refreshed":false,
+//	 "as_of":"...Z","members":[{"model":"codex/example(high)","mapping":"codex",
+//	 "status":"confirmed","reason":"available quota","headroom":0.9,
+//	 "checked_at":"...Z"}],"error":"optional"}
+type groupOutcomeJSON struct {
+	Version   int               `json:"version"`
+	Status    string            `json:"status"`
+	Reason    string            `json:"reason"`
+	Group     string            `json:"group"`
+	Model     *string           `json:"model"`
+	Refreshed bool              `json:"refreshed"`
+	AsOf      *string           `json:"as_of"`
+	Members   []groupMemberJSON `json:"members"`
+	Error     string            `json:"error,omitempty"`
+}
+
+type groupMemberJSON struct {
+	Model     string   `json:"model"`
+	Mapping   *string  `json:"mapping"`
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason"`
+	Headroom  *float64 `json:"headroom"`
+	CheckedAt *string  `json:"checked_at"`
+}
+
+func groupEnvelope(o selection.GroupOutcome) groupOutcomeJSON {
+	out := groupOutcomeJSON{
+		Version:   selectJSONVersion,
+		Status:    string(o.Status),
+		Reason:    o.Reason,
+		Group:     validate.DefaultSanitize([]byte(o.Group)),
+		Refreshed: o.Refreshed,
+		Members:   make([]groupMemberJSON, len(o.Members)),
+	}
+	if !o.AsOf.IsZero() {
+		asOf := o.AsOf.UTC().Format(time.RFC3339)
+		out.AsOf = &asOf
+	}
+	for i, m := range o.Members {
+		j := groupMemberJSON{
+			Model:    validate.DefaultSanitize([]byte(m.Reference)),
+			Status:   m.Status,
+			Reason:   validate.DefaultSanitize([]byte(m.Reason)),
+			Headroom: m.Headroom,
+		}
+		if m.Mapping != "" {
+			mapping := validate.DefaultSanitize([]byte(m.Mapping))
+			j.Mapping = &mapping
+		}
+		if m.CheckedAt != nil {
+			at := m.CheckedAt.UTC().Format(time.RFC3339)
+			j.CheckedAt = &at
+		}
+		out.Members[i] = j
+	}
+	if o.Selected >= 0 && o.Selected < len(out.Members) {
+		model := out.Members[o.Selected].Model
+		out.Model = &model
+	}
+	return out
+}
+
 // evalReportJSON is the normative top-level select-eval shape: the schema
 // version, an optional fatal error, and the safe evaluation report.
 //
