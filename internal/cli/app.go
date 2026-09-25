@@ -43,6 +43,12 @@ type SelectRunner interface {
 	Run(ctx context.Context, req selection.SelectRequest) (selection.SelectOutcome, error)
 }
 
+// GroupSelectRunner runs one select-group invocation. The production
+// implementation is selection.SelectRunner.
+type GroupSelectRunner interface {
+	RunGroup(ctx context.Context, req selection.GroupRequest) (selection.GroupOutcome, error)
+}
+
 // SelectEvalRunner runs one select-eval invocation. The production
 // implementation is selection.EvaluationRunner.
 type SelectEvalRunner interface {
@@ -69,6 +75,8 @@ type Dependencies struct {
 	Policy service.PolicyLoader
 	// Select runs model-selection invocations (the select command).
 	Select SelectRunner
+	// SelectGroup runs model-group selection invocations (select-group).
+	SelectGroup GroupSelectRunner
 	// SelectEval runs operator evaluation invocations (select-eval).
 	SelectEval  SelectEvalRunner
 	Environment func() map[string]string
@@ -154,6 +162,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runInstallHook(args[1:], deps, stdout, stderr)
 	case "select":
 		return runSelect(ctx, args[1:], deps, stdin, stdout, stderr)
+	case "select-group":
+		return runSelectGroup(ctx, args[1:], deps, stdin, stdout, stderr)
 	case "select-eval":
 		return runSelectEval(ctx, args[1:], deps, stdout, stderr)
 	default:

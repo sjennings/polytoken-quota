@@ -94,6 +94,17 @@ esac
 
 Output contains no prompt, credential, raw upstream response, or arbitrary upstream error text. Do not add those to caller logs.
 
+## Polytoken model groups
+
+`select-group` reports quota for one Polytoken model group and recommends a member. polytoken-quota never reads Polytoken's `modelgroups` configuration. The caller, usually a skill that already knows which group it will dispatch, sends the group on stdin with nested `@mg:` references already flattened into concrete members, in failover order:
+
+```sh
+echo '{"group":"fast","models":["codex/example(high)","anthropic/example"]}' \
+  | polytoken-quota select-group --json
+```
+
+Every member is classified with the same rules as `select`: `confirmed`, `uncertain` with an evidence category, or `excluded` with a reason. The recommendation follows Polytoken's failover order rather than headroom ranking. It is the first confirmed member, otherwise the first uncertain one, otherwise `no_selection`. Members not registered in desired configuration are `uncertain` with evidence `unmanaged`: there is no quota evidence for them, but Polytoken may still route to them. Unflattened group references, malformed references, unknown fields and oversized requests are fatal. `--exclude-family` and `--refresh` behave as they do for `select`. There is no difficulty assessment, and exit codes match `select`. JSON version 1 carries `status`, `reason`, `group`, a nullable `model`, `refreshed`, `as_of`, and `members[]` (each with `model`, `mapping`, `status`, `reason`, `headroom` and `checked_at`).
+
 ## Quota semantics and waves
 
 Default selection reads one saved desired/state/as-of snapshot. It does not poll, reconcile targets, signal sessions, or write state. `--refresh` explicitly performs one quota check without reconciliation, finishes that transaction, then snapshots and assesses. A fatal check stops selection; an accepted check with provider problems may still leave usable last-good evidence. Refresh retains ordinary `check` semantics with reconciliation disabled; it does not request target publication or session actions.

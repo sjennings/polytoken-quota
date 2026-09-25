@@ -384,6 +384,7 @@ func main() {
 		HistoryQuerier:  historyReader,
 		Policy:          coord.Policy,
 		Select:          selectRunner,
+		SelectGroup:     selectRunner,
 		SelectEval:      evalRunner,
 	})
 	os.Exit(code)

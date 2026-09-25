@@ -39,7 +39,7 @@ type helpDoc struct {
 
 // commandOrder is the display order for top-level commands in root help.
 var commandOrder = []string{
-	"init", "status", "check", "reconcile", "routing", "doctor", "history", "select", "select-eval", "notice-hook", "install-hook",
+	"init", "status", "check", "reconcile", "routing", "doctor", "history", "select", "select-group", "select-eval", "notice-hook", "install-hook",
 }
 
 // helpDocs maps each command path to its help content. Top-level commands use
@@ -149,6 +149,16 @@ var helpDocs = map[string]helpDoc{
 			{"--exclude-family NAME", "Exclude one exact provider family (the prefix before /); repeatable"},
 			{"--refresh", "Perform one provider quota poll without reconciliation before snapshotting; default reads the saved snapshot without polling"},
 			{"--json", "Output JSON (version 1; nullable model and status)"},
+		},
+	},
+	"select-group": {
+		short: "Report quota for a Polytoken model group and recommend one member (never launches work)",
+		long:  "Read one model group from stdin as JSON — {\"group\":\"NAME\",\"models\":[\"provider/model(suffix)\",...]} — with its concrete members flattened in failover order, report every member's quota evidence, and recommend the first confirmed member (otherwise the first uncertain one). polytoken-quota never reads Polytoken's model-group configuration; the caller supplies the group. Members not registered in desired configuration are reported as uncertain with evidence \"unmanaged\". No difficulty assessment is performed.",
+		usage: []string{"polytoken-quota select-group [--exclude-family NAME]... [--refresh] [--json] < group.json"},
+		flags: []flagDoc{
+			{"--exclude-family NAME", "Exclude one exact provider family (the prefix before /); repeatable"},
+			{"--refresh", "Perform one provider quota poll without reconciliation before snapshotting"},
+			{"--json", "Output JSON (version 1; nullable model, per-member report)"},
 		},
 	},
 	"select-eval": {
