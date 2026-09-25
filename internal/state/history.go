@@ -735,6 +735,7 @@ func ValidateEventHistory(h EventHistory) error {
 func SanitizeEventHistory(h EventHistory) EventHistory {
 	out := EventHistory{OmittedEvents: h.OmittedEvents, Events: make([]EventRecord, len(h.Events))}
 	for i, e := range h.Events {
+		e.At, e.RecordedAt = e.At.UTC(), e.RecordedAt.UTC()
 		e.Provider = sanitizeEventProvider(e.Provider)
 		e.MappingID = sanitizeIdentifier(e.MappingID)
 		e.Action = sanitizeText(e.Action)

@@ -249,6 +249,22 @@ func TestAggregateRecordBoundsCompactPendingTextToRecordCeiling(t *testing.T) {
 	}
 }
 
+// Callers stamp events with a wall clock in the local zone; the history must
+// still validate rather than making the following state save fail.
+func TestEventHistoryAppendNormalizesTimesToUTC(t *testing.T) {
+	local := historyTestTime.In(time.FixedZone("CDT", -5*3600))
+	h, err := AppendEvent(EventHistory{}, EventRecord{Sequence: 1, Revision: 1, At: local, RecordedAt: local, Category: EventNotice, Action: "notice-publish", Result: EventFailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateEventHistory(h); err != nil {
+		t.Fatalf("local-zone event rejected: %v", err)
+	}
+	if !h.Events[0].At.Equal(historyTestTime) {
+		t.Fatalf("instant changed: %v", h.Events[0].At)
+	}
+}
+
 func TestEventHistoryAppendIsNewestFirstAndDeepCopied(t *testing.T) {
 	at := historyTestTime
 	e := EventRecord{Sequence: 2, Revision: 2, Ordinal: 0, At: at, RecordedAt: at, Category: EventHook, Action: "quota_reached", Provider: "codex", Result: EventChanged, Reason: "Bearer SECRET account=alice", Changes: []string{"defaults.full"}}
