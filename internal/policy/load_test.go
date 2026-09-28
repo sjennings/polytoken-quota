@@ -211,7 +211,7 @@ func TestLoadOperationalBounds(t *testing.T) {
 			t.Fatal("accepted zero backup count")
 		}
 	})
-	t.Run("backup count omitted in partial section defaults to 5", func(t *testing.T) {
+	t.Run("backup count omitted in partial section defaults to 1", func(t *testing.T) {
 		yaml := "version: 1\nproviders: {a: {models: [codex/m]}}\noperational: {validation_timeout: 60s}"
 		d, err := Load(writeTemp(t, yaml))
 		if err != nil {
@@ -220,8 +220,8 @@ func TestLoadOperationalBounds(t *testing.T) {
 		if d.Operational.ValidationTimeout != 60*time.Second {
 			t.Fatalf("validation_timeout=%v want 60s", d.Operational.ValidationTimeout)
 		}
-		if d.Operational.BackupCount != 5 {
-			t.Fatalf("backup_count=%d want default 5", d.Operational.BackupCount)
+		if d.Operational.BackupCount != 1 {
+			t.Fatalf("backup_count=%d want default 1", d.Operational.BackupCount)
 		}
 	})
 	t.Run("backup count explicit value honored", func(t *testing.T) {
@@ -469,14 +469,14 @@ func TestLoadRoutingQuotaBackwardCompat(t *testing.T) {
 	}
 	for _, id := range []MappingID{"codex", "zai"} {
 		q := d.Providers[id].Quota
-		if q == nil || q.Adapter != string(id) || q.FreshnessTTL != defaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 || q.Schedule != nil {
+		if q == nil || q.Adapter != string(id) || q.FreshnessTTL != DefaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 || q.Schedule != nil {
 			t.Fatalf("mapping %q quota=%+v, want normalized defaults", id, q)
 		}
 	}
 }
 
 func TestLoadOmittedQuotaDefaults(t *testing.T) {
-	for _, id := range []string{"codex", "zai", "neuralwatt"} {
+	for _, id := range []string{"codex", "zai", "neuralwatt", "opencode-go", "antigravity"} {
 		t.Run(id, func(t *testing.T) {
 			yaml := "version: 1\nproviders:\n  " + id + ":\n    models: [" + id + "/model]\n"
 			d, err := Load(writeTemp(t, yaml))
@@ -484,7 +484,7 @@ func TestLoadOmittedQuotaDefaults(t *testing.T) {
 				t.Fatalf("Load: %v", err)
 			}
 			q := d.Providers[MappingID(id)].Quota
-			if q == nil || q.Adapter != id || q.FreshnessTTL != defaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 {
+			if q == nil || q.Adapter != id || q.FreshnessTTL != DefaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 {
 				t.Fatalf("quota=%+v, want normalized defaults", q)
 			}
 		})
@@ -503,7 +503,7 @@ providers:
 		t.Fatalf("Load: %v", err)
 	}
 	q := d.Providers["codex"].Quota
-	if q == nil || q.Adapter != "codex" || q.FreshnessTTL != defaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 {
+	if q == nil || q.Adapter != "codex" || q.FreshnessTTL != DefaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1 {
 		t.Fatalf("quota=%+v, want normalized defaults", q)
 	}
 }
@@ -539,7 +539,7 @@ func TestLoadAnthropicQuotaSemantics(t *testing.T) {
 			if (q == nil) != tc.wantNil {
 				t.Fatalf("quota=%+v, want nil=%v", q, tc.wantNil)
 			}
-			if q != nil && (q.MonthlyBudgetUSD != 250 || q.FreshnessTTL != defaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1) {
+			if q != nil && (q.MonthlyBudgetUSD != 250 || q.FreshnessTTL != DefaultQuotaFreshness || q.BalanceGroup != "default" || q.Weight != 1) {
 				t.Fatalf("quota=%+v, want positive-budget defaults", q)
 			}
 		})
@@ -581,7 +581,7 @@ providers:
 	if err == nil {
 		t.Fatal("expected rejection of unknown adapter mapping key, got nil")
 	}
-	for _, want := range []string{"codex2", "codex", "zai", "anthropic", "neuralwatt"} {
+	for _, want := range []string{"codex2", "codex", "zai", "anthropic", "neuralwatt", "opencode-go"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err.Error(), want)
 		}

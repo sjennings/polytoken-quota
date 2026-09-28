@@ -2,16 +2,16 @@
 
 `polytoken-quota` polls provider quota directly, records durable sanitized state, and reconciles explicitly managed Polytoken model fields. It supports one global Polytoken configuration and registered project configurations.
 
-Quota polling participates per supported provider mapping: omitted or empty `quota` uses adapter defaults, while Anthropic requires either a positive `monthly_budget_usd` for API spend polling or `mode: subscription` for experimental Claude subscription-window polling. Quota-based routing is enabled by default. The tool ranks configured, pollable providers by quota projection pace (how fast each is burning its quota relative to its reset cycle), availability, balance group, off-peak schedules, and weight, then applies the resulting order through the normal validated reconciliation flow. Set `routing: {enabled: false}` in `desired.yaml` to opt out.
+Quota polling participates per supported provider mapping: omitted or empty `quota` uses adapter defaults, while Anthropic requires either a positive `monthly_budget_usd` for API spend polling or `mode: subscription` for experimental Claude subscription-window polling. Quota-based routing is enabled by default. The tool ranks configured, pollable providers by a use-it-or-lose-it signal (how much quota each would forfeit unused at reset, net of how far it has overspent), availability, balance group, off-peak schedules, and weight, then applies the resulting order through the normal validated reconciliation flow. Set `routing: {enabled: false}` in `desired.yaml` to opt out.
 
-The tool never contacts a running Polytoken daemon from the host; change propagation to live sessions is opt-in and session-scoped (see [Change propagation to running sessions](#change-propagation-to-running-sessions)). It stores no provider credentials and persists no raw provider responses, auth headers, or account IDs.
+The tool never contacts a running Polytoken daemon from host commands; change propagation to live sessions is opt-in and session-scoped (see [Change propagation to running sessions](#change-propagation-to-running-sessions)). Provider-only policies are an explicit opt-in: they gate enrolled Polytoken providers without managing groups, defaults, model flags, or facet/subagent assignments, and do not guarantee a particular fallback. The tool stores no provider credentials and persists no raw provider responses, auth headers, or account IDs.
 
 ## Minimum versions
 
 | Component | Minimum | Notes |
 |-----------|---------|-------|
 | Go toolchain | `go 1.26.5` | Exact version match (`go env GOVERSION`). |
-| Polytoken | `0.6.6` | Supported validation contract (resolved from `PATH`). |
+| Polytoken | none | Opt-in contract suite pins behavior, not a release number; resolved from `POLYTOKEN_CONTRACT_BIN` (or `POLYTOKEN_BIN`). |
 
 ## Install and initial setup
 
@@ -102,15 +102,59 @@ projects: []
 
 Unknown/manual mappings without a supported quota adapter remain managed routing participants: they keep their configured chain positions, are not quota-ranked or polled, and still honor explicit disable or unavailable state. Every configured mapping appears in diagnostics, including defaulted supported mappings and unpollable Anthropic/manual mappings.
 
-The `models` list is the ownership boundary: only listed concrete models and the listed target chains/definition fields are managed. Preserve unmanaged Polytoken settings outside those fields. Model entries may be bare names, as shown above, or explicit mappings such as `codex/gpt-5: {enabled: true}`.
+The `models` list is the ownership boundary: only listed concrete models and the listed target chains/definition fields are managed. Preserve unmanaged Polytoken settings outside those fields. Model entries may be bare names, as shown above, or explicit mappings such as `codex/gpt-5: {enabled: true}`. When your Polytoken config uses `modelgroups`, legacy reconcile leaves the tier defaults unwritten and operator-owned instead of producing a candidate Polytoken rejects (details in the configuration reference).
 
-See **[docs/configuration.md](docs/configuration.md)** for the complete reference: every quota field (`monthly_budget_usd`, `freshness_ttl`, `balance_group`, `weight`, `schedule`), routing opt-out, and the `operational` knobs, with their defaults.
+See **[docs/configuration.md](docs/configuration.md)** for the complete reference: every quota field (`monthly_budget_usd`, `freshness_ttl`, `balance_group`, `weight`, `schedule`), routing opt-out, provider-only mode, and the `operational` knobs, with their defaults.
+
+#### Provider-only mode for Polytoken model groups
+
+For version-4 configurations built around Polytoken-owned model groups, provider-only mode is an explicit opt-in. It tracks provider IDs and changes only enrolled global `providers.<id>.enabled` fields:
+
+```yaml
+version: 1
+mode: provider-only
+providers:
+  codex:
+    quota:
+      adapter: codex
+  team-llm: {}
+global:
+  root: /home/user/.config/polytoken
+operational:
+  notice_path: /shared/polytoken-quota/notice.json
+```
+
+Reserve and exhausted/disabled quota gate a provider off; recovery restores only the baseline the quota process recorded and still owns. Groups, tier defaults, model enabled flags, and facet/subagent assignments remain operator-owned. Same-name global and project groups have been observed to concatenate global leaves before project leaves while retaining duplicates; this mode does not select or promise a specific remaining model. When migrating from legacy policy, old quota-authored chains and model flags remain in Polytoken as operator-owned edits; review `init --provider-only --preview` and its rollback information before applying. See the [configuration reference](docs/configuration.md#policy-modes-legacy-and-provider-only).
 
 ### Neuralwatt adapter
 
 The `neuralwatt` adapter polls Neuralwatt Cloud's read-only quota endpoint (`GET /v1/quota`) with a transient `NEURALWATT_API_KEY` Bearer credential. It selects the first present boundary in this order: key-specific allowance, subscription energy allowance, then provider-reported USD credit balance for PAYG accounts. A present but malformed boundary fails closed rather than falling back to a weaker signal. A blocked key, subscription overage, exhausted balance, authentication failure, or missing/invalid selected limit is never treated as healthy.
 
 The adapter reports the selected provider boundary as one routing window. Usage and energy totals are retained only as provider diagnostics in the response contract; they are not used as a synthetic quota when no enforceable allowance or balance is available. The account balance path does not invent a reset time when the provider does not report one.
+
+### OpenCode Go adapter
+
+The `opencode-go` adapter polls OpenCode Go's read-only usage endpoint (`GET /zen/go/v1/usage`) with a transient Bearer credential: `OPENCODE_GO_API_KEY` when set, otherwise the key OpenCode itself saved at login in `auth.json` (`$XDG_DATA_HOME/opencode/auth.json`, else `~/.local/share/opencode/auth.json`; the `opencode-go` entry, then `opencode`). The response reports up to three usage windows — `rolling` (5 hours), `weekly`, and `monthly` — each as a percentage of a monthly per-model cap alongside a reset timestamp.
+
+`percent` is **percent used**, never dollars, so this adapter needs no `monthly_budget_usd`. All three windows participate in routing, and the provider's effective remaining allowance is the minimum across them — the same conservative rule the Codex adapter applies to its 5-hour session window. A `rolling` window at 100% therefore demotes the provider for the remainder of that 5-hour window even when the monthly allowance is largely unused. That is deliberate and matches existing repo-wide behaviour, not an OpenCode-specific rule.
+
+Reset anchoring uses the longest window reporting a future reset (in practice `monthly`). The 5-hour `rolling` window is shorter than the one-day quota-cycle floor, so it never drives next-reset or the routing signal — but it does still govern availability.
+
+Fail-closed semantics:
+
+- Window `status` is advisory (`ok` or `rate-limited`) and availability derives from `percent`. A window with a missing or unrecognized `status`, or a missing, non-numeric, or non-finite `percent`, fails that window closed rather than falling back to a weaker signal. A payload in which no window decodes is an error, never an empty healthy snapshot.
+- A window without a parseable reset timestamp still decodes, without a reset time, and marks the snapshot `partial`. Reset times are never invented.
+- An exhausted window (`percent: 100`) is reported as unavailable and classed `exhausted` — not as an error.
+- `401` (missing or invalid key) and `403` (valid key with no OpenCode Go subscription) fail closed with distinct, sanitized diagnostics. `429` fails closed with a `Retry-After`-aware message and retries on the next scheduled check.
+- A check with absent, expired, or incomplete contract evidence — or with neither `OPENCODE_GO_API_KEY` nor a usable `auth.json` key — returns an error **without making any HTTP request**.
+
+Not synthesized: the endpoint exposes no dollar amounts and no per-model breakdown, so the adapter reports no monetary budget and no per-model windows. Nothing is inferred from the provider's Zen credit balance. The `auth.json` fallback reads only the key field of those two entries, transiently, for the one request; the file's contents never reach an error, snapshot, or state.
+
+The endpoint contract is derived from OpenCode's first-party open-source console code and is **not officially documented**, so its evidence is reviewed quarterly rather than annually. If OpenCode changes or withdraws the route, the adapter fails closed instead of reporting a stale or invented allowance.
+
+### Antigravity adapter
+
+The `antigravity` adapter runs the Antigravity CLI's local quota command, `agy -p /quota --output-format json`, so the `agy` CLI must be installed on `PATH` and already logged in. Only the **Gemini** quota group is counted (its 5-hour and weekly buckets); the Claude/GPT group is ignored. The CLI runs without a shell, with a 15-second timeout, and with `open`/`xdg-open` replaced by stubs that refuse, so a logged-out CLI cannot launch a browser login from a scheduled run; it fails closed instead. The adapter does not inspect other processes. The expected output shape follows [quota-axi](https://github.com/kunchenguid/quota-axi) and has **not** yet been confirmed against a live, eligible account. An `agy` account that Google has flagged as ineligible ("Verify your account to continue") fails the check until you verify it in a browser yourself.
 
 ### Anthropic adapters
 
@@ -292,7 +336,7 @@ Headroom fractions are not comparable token counts across providers. Positive he
 | `assessment_unavailable` | `2` | No usable automatic assessment; model is null. |
 | `error` | `1` | Invalid invocation, policy/configuration/state, missing consent/credential, or another fatal failure. |
 
-Human output labels uncertainty explicitly. JSON includes `model`, `mapping` (the quota owner), effective `tier`, original `assessed_tier`, `assessed_model`, `reason`, quota `evidence` and `headroom`, and snapshot timestamps `as_of` / `evidence_checked_at` when relevant. Automatic results also carry validated `confidence` and `probabilities`; explicit-tier selection has no classifier assessment. Do not interpret its default confidence value as a classifier judgment.
+Human output labels uncertainty explicitly. JSON includes `version`, `explicit_tier`, `abstained`, `refreshed`, `model`, `mapping` (the quota owner), effective `tier`, original `assessed_tier`, `assessed_model`, `reason`, quota `evidence` and `headroom`, and snapshot timestamps `as_of` / `evidence_checked_at` when relevant. Automatic results also carry validated `confidence` and `probabilities`; explicit-tier selection has no classifier assessment. Do not interpret its default confidence value as a classifier judgment.
 
 For shell automation, preserve exit 2 and inspect the status instead of extracting a model blindly. This example requires `jq`:
 
@@ -318,9 +362,9 @@ polytoken-quota select-eval --policy candidates.yaml \
   --fixtures docs/selection-fixtures.yaml --live --json
 ```
 
-The candidate policy must cover every fixture's phase and expected tier, and all candidate models must be registered. The shipped fixtures cover all four tiers, abstention, misleading embedded instructions, short high-risk work, and non-English tasks. Fixture documents are bounded to 256 KiB and use non-sensitive synthetic prompts.
+The candidate policy must cover every fixture's phase and expected tier, and all candidate models must be registered. The shipped fixtures cover all four tiers, abstention, misleading embedded instructions, short high-risk work, and non-English tasks. Fixture documents are bounded to 256 KiB and 64 cases per invocation and use non-sensitive synthetic prompts. Each assessed case can incur one paid request; larger evaluations require separately authorized batches.
 
-The report includes case IDs, expected/actual assessments, safe errors, confusion counts, under/over-classification and abstention rates, classifier/rubric versions, latency, and token usage when provided—not task text or raw responses. Exit `0` means all fixtures matched; `2` means mismatches or unavailable assessments; `1` means invalid input/configuration or a missing credential. This report is not an adopted quality threshold.
+The report includes case IDs, expected/actual assessments, safe errors, confusion counts, under/over-classification and abstention rates, classifier/rubric versions, latency, and token usage when provided—not task text or raw responses. Exit `0` means all fixtures matched; `2` means mismatches, unavailable assessments, or policy-rejected cases; `1` means invalid input/configuration, cancellation, or a missing credential. This report is not an adopted quality threshold.
 
 Offline repository tests verify protocol handling, selection, persistence boundaries, and report arithmetic, **not live Jev quality or latency**. Review a separately authorized evaluation before adoption and repeat it when the model pin or rubric changes. No live evaluation or workflow migration is automatic. See the [selection guide](docs/selection.md) for the full contract and provider references, and the [configuration reference](docs/configuration.md#selectionjev) for operator settings.
 
@@ -332,8 +376,8 @@ Offline repository tests verify protocol handling, selection, persistence bounda
 | `select --policy PATH --phase NAME [--difficulty TIER | --min-difficulty TIER] [--exclude-family NAME] [--refresh] [--json]` | Recommend a candidate; automatic mode reads stdin, explicit tier stays local. |
 | `select-eval --policy PATH --fixtures PATH --live [--json]` | Operator-authorized rubric evaluation; never invoked by normal selection or tests. |
 | `status [--json]` | Show the merged quota and routing view: routing enablement, one global last-checked time, every configured mapping's status/reason, raw per-window quota numbers, next resets, compact target/source route rows with first desired/effective models, and a pending-config warning pointing at `doctor`. `--json` additionally retains ranking fields, route provenance, and complete desired/effective chains. |
-| `check [--provider <id>] [--reconcile] [--json] [--quiet]` | Poll quota once; optionally filter a mapping, reconcile after saving, emit JSON, or suppress all output (for cron/launchd/systemd). |
-| `reconcile [--dry-run [--keep-staging]] [--verbose]` | Reconcile managed Polytoken fields toward desired state. Quiet by default: without `--verbose` output is the exit code only (0 success, 1 rejected, 2 pending when applying — a dry-run pending exits 0; usage/flag errors still print to stderr). On a silent non-zero exit, re-run with `--verbose`: applied targets print only their outcome; pending targets print the full sanitized failure — external validation output capped at 256 KiB and always redacted, or the quota-own error chain — plus any retained staging path. Transact-level failures (policy load, target resolution) are persisted nowhere, so `--verbose` is their only diagnostic surface. `--keep-staging` (dry-run only) retains a failed validation candidate for inspection: the candidate moves to a deterministic per-target name (`quota-retain-<target-id>`, replacing any prior retained root) and the path prints only under `--verbose`; the caller owns deleting it (it may contain merged configuration). |
+| `check [--provider <id>] [--reconcile] [--json] [--quiet]` | Poll quota once; optionally filter a mapping, reconcile after saving (including provider-only gating), emit JSON, or suppress all output (for cron/launchd/systemd). |
+| `reconcile [--dry-run [--keep-staging]] [--verbose]` | Reconcile managed fields; in provider-only mode gates enrolled providers after safety analysis and staged validation. Quiet by default. `--keep-staging` is dry-run only; retained candidates may contain merged configuration. |
 | `routing enable <mapping-id>` | Enable a provider mapping (clear manual disable). |
 | `routing disable <mapping-id>` | Disable a provider mapping (hard exclusion). |
 | `routing reset` | Clear all manual disables while preserving automatic observations. |
@@ -346,11 +390,11 @@ The `routing` commands manage per-mapping routing state. The top-level `routing.
 
 Existing commands use `0` for an accepted clean result, `1` for a rejected request or diagnostic failure, and `2` for an accepted operation with a pending provider, quota, target, or validation problem. `check --json` and `status --json` emit one sanitized structured envelope for accepted and rejected requests.
 
-For `select`, `0` means `confirmed`; `2` means `uncertain`, `no_selection`, or `assessment_unavailable`; `1` means a fatal input/configuration/state error. Inspect status before using a recommendation: uncertainty is not known availability. For `select-eval`, `0` means every fixture matched, `2` means mismatches or unavailable assessments, and `1` means invalid input/configuration. Mocked tests do not establish Jev quality; the operator must review an explicitly authorized live evaluation before adoption.
+For `select`, `0` means `confirmed`; `2` means `uncertain`, `no_selection`, or `assessment_unavailable`; `1` means a fatal input/configuration/state error. Inspect status before using a recommendation: uncertainty is not known availability. For `select-eval`, `0` means every fixture matched, `2` means mismatches, unavailable assessments, or policy-rejected cases, and `1` means invalid input/configuration or cancellation. Mocked tests do not establish Jev quality; the operator must review an explicitly authorized live evaluation before adoption.
 
 ## Meaningful event history
 
-`polytoken-quota history` is a newest-first timeline of meaningful provider and routing events, not a generic reconcile counter. It records quota low/reached/reset transitions, provider failures/recoveries, manual disable/enable/reset actions, ignored stale hooks, quota-poll failures, and routing changes such as rank, eligibility, pace explanation, or peak/off-peak changes. Unchanged quota observations and unchanged routing decisions are suppressed.
+`polytoken-quota history` is a newest-first timeline of meaningful provider and routing events, not a generic reconcile counter. It records quota low/reached/reset transitions, provider failures/recoveries, manual disable/enable/reset actions, ignored stale hooks, quota-poll failures, and routing changes such as rank, eligibility, signal explanation, or peak/off-peak changes. Unchanged quota observations and unchanged routing decisions are suppressed.
 
 ```text
 EVENT HISTORY
@@ -358,7 +402,7 @@ Reported at: 2026-08-14 02:30:00 UTC
 
 WHEN                 PROVIDER   EVENT                    RESULT
 2026-08-14 02:22:35  zai        quota_reached             disabled; removed from managed chains
-2026-08-13 14:04:03  codex      routing_changed           rank 1 -> 3; over pace
+2026-08-13 14:04:03  codex      routing_changed           rank 1 -> 3; overdrawn
 2026-08-13 10:19:59  zai        provider_recovered        available; quota remains exhausted
 2026-08-13 10:15:00  zai        quota_low                 IGNORED; stale quota event
 ```
@@ -391,8 +435,8 @@ polytoken-quota status
 routing: enabled    last checked: 2026-08-14 09:12 UTC
 
 PROVIDER  STATUS     REASON                    QUOTA                     NEXT RESET
-codex     available  peak, pace 50%            5h 41/80, weekly 120/400  2026-08-15 00:00 UTC
-zai       available  off-peak, pace 109%       5h 41/80, weekly 120/400  2026-08-15 00:00 UTC
+codex     available  peak, signal +1.00        5h 41/80, weekly 120/400  2026-08-15 00:00 UTC
+zai       available  off-peak, signal -0.19    5h 41/80, weekly 120/400  2026-08-15 00:00 UTC
 minime    enabled    not configured             no data                   —
 
 TARGET  SOURCE                 ROUTE     DESIRED       EFFECTIVE
@@ -412,11 +456,52 @@ Routing uses a deterministic lexicographic ranking, not a blended score:
 
 1. Providers must be eligible: their mode is `normal` or `reserve`, their snapshot is fresh, and it contains usable remaining quota.
 2. Eligible providers stay grouped by `balance_group`; groups appear in their first configured order and do not interleave.
-3. Within each group, providers are first separated into two pace tiers. Providers with **projection pace below 90%** are treated as equally under-paced: their exact pace does not differentiate them. They rank ahead of providers at or above 90%, and ties break by off-peak before peak, then higher `weight`.
-4. Among providers at or above 90%, lower projection pace ranks first. Providers within 10% absolute pace are treated as tied, with off-peak and `weight` breaking ties. Pace is the ratio of used-fraction to elapsed-fraction from each provider's longest qualifying quota window (period + reset + remaining, minimum one day).
-5. If providers remain equal after pace, schedule, and weight, they share a routing rank. Each desired route then keeps its own authored order for those providers; mapping ID is used only to keep diagnostic presentation deterministic. If any eligible provider in a balance group cannot compute a pace (no qualifying window), pace is skipped for that whole group. Ineligible providers remain at the end and are never disabled by routing.
+3. Within each group, providers are ordered by their **use-it-or-lose-it signal**, highest first (see [How the routing signal is scored](#how-the-routing-signal-is-scored)). Positive means quota will reach reset unused, zero is exactly on pace, and negative means overdrawn.
+4. Signals are clustered: after sorting, a new cluster starts wherever two neighboring signals differ by 0.20 or more. Providers in the same cluster are tied on the signal, and off-peak before peak, then higher `weight`, break the tie.
+5. If providers remain equal after signal, schedule, and weight, they share a routing rank. Each desired route then keeps its own authored order for those providers; mapping ID is used only to keep diagnostic presentation deterministic. If any eligible provider in a balance group has no signal (no qualifying window), the signal is skipped for that whole group. Ineligible providers remain at the end and are never disabled by routing.
 
-For example, if `codex` and `neuralwatt` are both eligible in the same balance group, both have pace below 90%, and have equal schedule and weight, they share a rank. A researcher chain authored as `neuralwatt` then `codex` stays Neuralwatt-first, while an implementer chain authored as `codex` then `neuralwatt` stays Codex-first. If one provider is below 90% and the other is at or above 90%, the under-paced provider ranks first.
+For example, if `codex` and `neuralwatt` are both eligible in the same balance group with signals +0.40 and +0.30, and equal schedule and weight, they share a rank. A researcher chain authored as `neuralwatt` then `codex` stays Neuralwatt-first, while an implementer chain authored as `codex` then `neuralwatt` stays Codex-first. If Codex's signal were +0.90 instead, Codex would rank first in both chains.
+
+### How the routing signal is scored
+
+Subscription quota is use-it-or-lose-it: whatever is left when a window resets is gone. The signal asks, for each provider, "how much paid allowance am I about to forfeit, net of how far I have already overspent?" and routes work to whoever would waste the most by being skipped.
+
+**Which windows count.** A window contributes when it reports a period of **at least one day**, a reset time, and a remaining fraction. Shorter windows, such as 5-hour session limits, are rate limits rather than quota cycles, so they never move the signal. An exhausted short window still makes the provider ineligible, so it drops out of ranking entirely until that window resets.
+
+**Per-window gap.** For a window with period `P`, remaining fraction `r` (0–1), and time until reset `R`:
+
+```text
+left     = max( clamp(R, 0, P) / P ,  1 hour / P )       # fraction of the period still to come
+elapsed  = max( min(ceil_to_day(P - R), P) / P ,  5 minutes / P )  # fraction already gone
+gap      = r / left  -  (1 - r) / elapsed
+```
+
+- `r / left` is the **forfeiture pressure**. Quota left over with little time remaining is about to expire, so this term grows as reset approaches.
+- `(1 - r) / elapsed` is the **burn rate**. It measures how much has been used relative to how much of the cycle has passed. Using quota faster than time passes makes it large.
+- On exact pace, for example 3/7 used on day 3 of a 7-day window, the two terms cancel and the gap is 0.
+
+**Combining windows.** When a provider reports several qualifying windows, such as weekly and monthly, their gaps are averaged weighted by period length, so a 30-day window counts about four times as much as a 7-day one. The result is clamped to ±100.
+
+**Why the floors and rounding.**
+- Elapsed time is **rounded up to whole days**. Right after a reset, a few minutes of use would otherwise look like a huge overdraft. The rounding means the signal leans slightly positive within a day, which is intentional.
+- The **one-hour floor** on time left keeps a window at or past its reset finite. Without it, a window about to reset with quota left would divide by zero.
+- The **five-minute floor** on elapsed time does the same for a window whose reset is a full period away.
+
+**Worked examples** (one 7-day window each):
+
+| Situation | Used | Day | Signal | Reading |
+|---|---|---|---|---|
+| Exactly on pace | 3/7 | 3 | **0.00** | nothing to reclaim, nothing overdrawn |
+| Under pace | 1/7 | 3 | **+1.17** | quota is piling up; prefer this provider |
+| Over pace | 5/7 | 3 | **−1.17** | burning too fast; route elsewhere |
+| Early, half pace | 1/7 | 2 | **+0.70** | ahead, but plenty of time to catch up |
+| Late, half pace | 3/7 | 6 | **+3.50** | 4/7 of the week expires tomorrow; drain it now |
+
+The last two rows show the difference from the old pace ranking. Both have used quota at half the rate time has passed, so pace called them equal. The signal knows the late one is about to lose most of its allowance and puts it first.
+
+**Rank ties.** The signal is continuous, but tiny differences shouldn't override your authored chain order on every poll. Providers are sorted by signal and grouped whenever neighbors differ by less than **0.20**. Mid-cycle, 0.20 of signal corresponds to about 0.10 of the used ÷ elapsed ratio, the same sensitivity the old pace bands had. Within a group, off-peak, `weight`, and then each chain's own authored order decide. If any eligible provider in a balance group reports no qualifying window, the signal is ignored for that whole group rather than guessed. `status` shows each provider's value as `peak, signal +0.42` / `off-peak, signal -1.30`.
+
+**Credit.** The signal is adapted from the `spendPriority` metric in [quota-axi](https://github.com/kunchenguid/quota-axi) by Kun Chen (MIT). The Antigravity adapter also follows quota-axi's `agy` output normalizer. This project reimplements those ideas in Go, keeps its own fail-closed eligibility rules, and ignores sub-day windows, so the numbers will not match quota-axi's exactly.
 
 The utility does not install, start, stop, or control timers. Set up scheduling manually and choose a cadence permitted by each provider. If desired, add jitter in the external scheduler or wrapper so multiple machines do not poll at once.
 
@@ -456,12 +541,12 @@ Example cron entry (run `crontab -e`):
 
 ## Change propagation to running sessions
 
-Host commands never contact Polytoken daemons. Instead, every reconcile that
-changes managed fields publishes a small tool-neutral notice document (schema
-version, revision, effective chains, changed fields, disabled models) at
-`operational.notice_path` (default `~/.local/polytoken-quota/notice.json`,
-atomically written, never containing credentials). Two delivery mechanisms
-consume it:
+Host commands never contact Polytoken daemons. A committed managed-field change
+publishes a small tool-neutral notice at `operational.notice_path` (default
+`~/.local/polytoken-quota/notice.json`, atomically written and never containing
+credentials). Legacy notices carry route facts; provider-only notices carry
+only provider IDs and enabled status. Two opt-in delivery mechanisms can
+consume the notice:
 
 **In-session convergence (opt-in).** `polytoken-quota install-hook` installs
 two entries into Polytoken's `hooks.json` (backup kept, unrelated entries
@@ -469,18 +554,17 @@ untouched, `--remove` to uninstall, `--dry-run` to preview). The handler is
 the `notice-hook` subcommand, which acts only on its **own** session's daemon
 via the documented loopback API with that session's own credential:
 
-- After each model turn, a session whose notice revision is newer than its
-  consumed marker reloads its daemon's configuration. Reloads are
-  turn-safe (a busy turn defers to the next one), preserve history, and
-  never restart or compact the session. A model whose provider was disabled
-  falls back to the configured chain head; routine quota rebalancing only
-  reorders chains and never forces a switch.
-- When you submit a prompt, a session running a model that dropped out of
-  its configured chain receives one non-blocking reminder per revision —
-  actionable if the model is disabled, informational if you deliberately
-  picked a model outside the chain. A reload-forced model change is reported
-  once (context on the new provider starts uncached). Switching models
-  always remains your choice; nothing compacts or swaps a session.
+- After a model turn, a session with a newer shared notice reloads only its
+  own daemon. A busy-turn `409` leaves the consumed marker unchanged, so a later
+  hook event can retry; the marker advances only after a successful `200`.
+  Reloading does not restart or compact the session. Prompt hooks accept without
+  blocking and provider-only notices do not claim a particular model change or
+  fallback.
+- Provider-only notices report the provider IDs and enabled status involved in
+  the committed change. They do not identify a serving model, assert a forced
+  switch, or guarantee which group leaf Polytoken will choose. The pinned
+  synthetic contract suite proves successful next-turn continuation for its
+  covered routes; this is not a promise for every configuration or provider.
 
 Because agent containers each run their own loopback-only daemon, the notice
 path must be visible inside them: bind-mount `~/.local/polytoken-quota` at
@@ -495,7 +579,7 @@ absolute executables on the host after a committed change, with the notice
 JSON on stdin — the generic hook for reconfiguring other CLIs or notifying
 yourself. Failures are recorded as events and never affect reconciliation.
 
-Changing quota policy or enabling routing may change the choices seen by
-existing Polytoken sessions; with the hook installed those sessions converge
-on their own, and the drift reminders keep you informed without forcing
-costly model swaps.
+Changing provider availability may affect which configured group leaves are
+usable. An installed hook asks each session's own daemon to reload after a turn;
+it does not issue a model-selection request or block a prompt. Provider-only
+mode does not promise a particular fallback or surface a drift reminder.

@@ -55,6 +55,10 @@ type config struct {
 	StagingRoot  string // parent of transient staging roots
 	GlobalDir    string // canonical global Polytoken configuration dir
 	PolytokenBin string // Polytoken executable for validation
+	// BackupCount is the pre-policy constructor placeholder for the backup
+	// store's retention limit. The Coordinator overwrites it from the loaded
+	// operational.backup_count (default 1) before every locked apply, so this
+	// value never governs a real apply.
 	BackupCount  int
 	Retention    time.Duration
 	LockWait     time.Duration
@@ -110,7 +114,9 @@ func resolveConfig() (config, error) {
 		StagingRoot:  filepath.Join(home, "stage"),
 		GlobalDir:    globalDir,
 		PolytokenBin: bin,
-		BackupCount:  5,
+		// Placeholder only: the Coordinator applies the policy-loaded
+		// operational.backup_count to the publisher before every apply.
+		BackupCount:  1,
 		Retention:    7 * 24 * time.Hour,
 		LockWait:     10 * time.Second,
 		ValidateWait: 30 * time.Second,
@@ -259,6 +265,16 @@ func newCoordinator(cfg config) *service.Coordinator {
 
 	loader := service.FilePolicyLoader{Path: cfg.DesiredPath}
 	registry := service.NewTargetRegistry()
+
+	// Pointer form is load-bearing: SetBackupLimit has a pointer receiver, so
+	// the Coordinator can retarget backup retention from the loaded policy
+	// only when the Publisher interface holds the adapter by pointer. This
+	// compile-time assertion fails on a value-form regression, which would
+	// otherwise build and silently stop applying operational.backup_count
+	// (review finding F-1, retention-impl-review).
+	adapter := &service.PublisherAdapter{Publisher: pub}
+	var _ service.BackupLimitSetter = adapter
+
 	return &service.Coordinator{
 		Lock:         publish.NewFileLock(cfg.LockPath),
 		Policy:       loader,
@@ -268,10 +284,11 @@ func newCoordinator(cfg config) *service.Coordinator {
 		Builder:      service.NewReconciler(),
 		Stage:        service.StagingStager{Builder: builder},
 		Validate:     service.ValidateRunner{Runner: runner},
-		Publish:      service.PublisherAdapter{Publisher: pub},
+		Publish:      adapter,
 		Sources:      policy.FilesystemSourceReader{GlobalDir: cfg.GlobalDir, DesiredPath: cfg.DesiredPath},
 		QuotaPoller:  service.NewQuotaPoller(),
 		JournalPath:  cfg.JournalPath,
+		BackupsPath:  cfg.BackupsRoot,
 	}
 }
 
@@ -291,21 +308,6 @@ func resolveRuntimeKey(context.Context) (string, error) {
 // configuration's model pin and timeout.
 func newSelectionClient(model string, timeout time.Duration) (*selection.Client, error) {
 	return selection.NewClient(model, resolveRuntimeKey, selection.ClientOptions{Timeout: timeout})
-}
-
-// selectionSnapshot adapts the coordinator's narrow business read to the
-// selection snapshot source. Target diagnostic failures cannot reach a
-// selection: targets are never resolved on this path.
-type selectionSnapshot struct {
-	coord *service.Coordinator
-}
-
-func (s selectionSnapshot) SelectionSnapshot(ctx context.Context) (selection.Snapshot, error) {
-	inputs, err := s.coord.SelectionInputs(ctx)
-	if err != nil {
-		return selection.Snapshot{}, err
-	}
-	return selection.Snapshot{Desired: inputs.Desired, State: inputs.State, AsOf: inputs.AsOf}, nil
 }
 
 // selectionRefresh adapts one opt-in quota check without reconciliation. A
@@ -331,16 +333,19 @@ func (r selectionRefresh) RefreshQuota(ctx context.Context) error {
 // credential resolver; the startup binary prerequisite is already enforced
 // by resolveConfig before either can run.
 func newSelectionRunners(coord *service.Coordinator) (*selection.SelectRunner, *selection.EvaluationRunner) {
-	snapshot := selectionSnapshot{coord: coord}
+	// The coordinator itself is the snapshot source: SelectionSnapshot
+	// returns selection.Snapshot directly, so no adapter or field copy is
+	// involved. Target diagnostic failures cannot reach a selection:
+	// targets are never resolved on this path.
 	selectRunner := &selection.SelectRunner{
-		Snapshot: snapshot,
+		Snapshot: coord,
 		Refresh:  selectionRefresh{coord: coord},
 		NewAssessor: func(model string, timeout time.Duration) (selection.Assessor, error) {
 			return newSelectionClient(model, timeout)
 		},
 	}
 	evalRunner := &selection.EvaluationRunner{
-		Snapshot: snapshot,
+		Snapshot: coord,
 		NewJev: func(model string, timeout time.Duration) (selection.EvalRunner, error) {
 			client, err := newSelectionClient(model, timeout)
 			if err != nil {
@@ -383,6 +388,7 @@ func main() {
 		SnapshotBuilder: coord,
 		HistoryQuerier:  historyReader,
 		Policy:          coord.Policy,
+		Previewer:       coord,
 		Select:          selectRunner,
 		SelectGroup:     selectRunner,
 		SelectEval:      evalRunner,

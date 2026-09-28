@@ -308,6 +308,8 @@ func buildReleaseRegistry() *quota.EvidenceRegistry {
 	reg.Register(quota.AnthropicEvidence(time.Now()))
 	reg.Register(quota.AnthropicSubscriptionEvidence(time.Now()))
 	reg.Register(quota.NeuralwattEvidence(time.Now()))
+	reg.Register(quota.OpenCodeGoEvidence(time.Now()))
+	reg.Register(quota.AntigravityEvidence(time.Now()))
 	return reg
 }
 
@@ -628,6 +630,167 @@ func TestCodexContractFixturesAreSecretFree(t *testing.T) {
 	}
 }
 
+// --- opencode-go adapter fixture acceptance --------------------------------
+//
+// These acceptance tests load the sanitized opencode-go fixture files from the
+// contract testdata tree, run them through the real quota.OpenCodeGoSource
+// adapter (behind a fake transport + synthetic credential resolver), and verify
+// the resulting QuotaSnapshot. They are the acceptance tests for the
+// opencode-go contract evidence.
+
+// opencodeKeyResolver returns a synthetic Bearer API key (no real secrets).
+type opencodeKeyResolver struct{ fail bool }
+
+func (r *opencodeKeyResolver) Resolve(quota.CredentialRef) (string, error) {
+	if r.fail {
+		return "", errors.New("missing key")
+	}
+	return "synthetic-opencode-key", nil
+}
+
+func loadOpenCodeGoFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	path := filepath.Join("testdata", "quota", "opencode-go", name)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", path, err)
+	}
+	return b
+}
+
+// newOpenCodeGoFixtureSource builds an OpenCodeGoSource with fresh evidence
+// whose transport answers with the given fixture bytes at the given status
+// code. The generic codexStubTransport is reused as the canned-response
+// transport.
+func newOpenCodeGoFixtureSource(t *testing.T, body []byte, code int) *quota.OpenCodeGoSource {
+	t.Helper()
+	reg := quota.NewEvidenceRegistry()
+	reg.Register(quota.OpenCodeGoEvidence(contractNow))
+	client := &quota.BoundedClient{
+		Transport:    &codexStubTransport{body: body, code: code},
+		Timeout:      time.Second,
+		MaxBodyBytes: 1 << 20,
+	}
+	return quota.NewOpenCodeGoSource("opencode-go-m1", client, &opencodeKeyResolver{}, reg, contractNow)
+}
+
+func TestOpenCodeGoContractFixtures(t *testing.T) {
+	// usage.json: full three-window 200 → fresh, available, normal class,
+	// anchored on the monthly reset.
+	t.Run("usage", func(t *testing.T) {
+		src := newOpenCodeGoFixtureSource(t, loadOpenCodeGoFixture(t, "usage.json"), http.StatusOK)
+		snap, err := src.Fetch(context.Background())
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if snap.Status != quota.SourceFresh {
+			t.Fatalf("status = %s, want fresh", snap.Status)
+		}
+		if snap.Availability != quota.QuotaAvailable {
+			t.Fatalf("availability = %s, want available", snap.Availability)
+		}
+		if got := snap.Class(); got != quota.ClassNormal {
+			t.Fatalf("class = %s, want normal", got)
+		}
+		r := contractFindWindow(snap.Windows, "rolling")
+		if r == nil || r.UsagePercent == nil || *r.UsagePercent != 12.5 {
+			t.Fatalf("rolling window = %v", r)
+		}
+		if w := contractFindWindow(snap.Windows, "weekly"); w == nil || w.UsagePercent == nil || *w.UsagePercent != 31.25 {
+			t.Fatalf("weekly window = %v", w)
+		}
+		if m := contractFindWindow(snap.Windows, "monthly"); m == nil || m.UsagePercent == nil || *m.UsagePercent != 48.75 {
+			t.Fatalf("monthly window = %v", m)
+		}
+		// The monthly window is the longest window at or above
+		// MinQuotaCyclePeriod with a future reset, so it anchors.
+		reset := snap.NextResetAt()
+		want := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+		if reset == nil || !reset.Equal(want) {
+			t.Fatalf("next reset = %v, want %v (monthly anchor)", reset, want)
+		}
+	})
+
+	// exhausted.json: a window at percent 100 with a rate-limited status →
+	// unavailable, exhausted — inside a 200 body.
+	t.Run("exhausted", func(t *testing.T) {
+		src := newOpenCodeGoFixtureSource(t, loadOpenCodeGoFixture(t, "exhausted.json"), http.StatusOK)
+		snap, err := src.Fetch(context.Background())
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if snap.Availability != quota.QuotaUnavailable {
+			t.Fatalf("availability = %s, want unavailable", snap.Availability)
+		}
+		if got := snap.Class(); got != quota.ClassExhausted {
+			t.Fatalf("class = %s, want exhausted", got)
+		}
+	})
+
+	// partial.json: the monthly window is absent and the weekly window carries
+	// an unparseable resetsAt → partial status; the windows that did decode
+	// still carry sensible data and a sensible class.
+	t.Run("partial", func(t *testing.T) {
+		src := newOpenCodeGoFixtureSource(t, loadOpenCodeGoFixture(t, "partial.json"), http.StatusOK)
+		snap, err := src.Fetch(context.Background())
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if snap.Status != quota.SourcePartial {
+			t.Fatalf("status = %s, want partial", snap.Status)
+		}
+		if r := contractFindWindow(snap.Windows, "rolling"); r == nil || r.ResetAt == nil {
+			t.Fatal("rolling window must decode with its valid reset")
+		}
+		if w := contractFindWindow(snap.Windows, "weekly"); w == nil || w.ResetAt != nil {
+			t.Fatal("weekly window must decode without a reset (unparseable resetsAt)")
+		}
+		if contractFindWindow(snap.Windows, "monthly") != nil {
+			t.Fatal("the absent monthly window must not be fabricated")
+		}
+		if got := snap.Class(); got != quota.ClassNormal {
+			t.Fatalf("class = %s, want normal from the decoded windows", got)
+		}
+	})
+
+	// auth_failure.json: the 401 AuthError envelope → fail closed with a
+	// sanitized diagnostic; the provider-controlled message is never echoed.
+	t.Run("auth_failure", func(t *testing.T) {
+		src := newOpenCodeGoFixtureSource(t, loadOpenCodeGoFixture(t, "auth_failure.json"), http.StatusUnauthorized)
+		snap, err := src.Fetch(context.Background())
+		if err == nil || snap.Status != quota.SourceFailed || snap.Availability != quota.QuotaUnknown {
+			t.Fatalf("snapshot=%+v err=%v", snap, err)
+		}
+		if len(snap.Windows) != 0 {
+			t.Fatalf("windows=%v, want none on auth failure", snap.Windows)
+		}
+		if !strings.Contains(err.Error(), "OPENCODE_GO_API_KEY") {
+			t.Fatalf("error=%q, want a diagnostic naming OPENCODE_GO_API_KEY", err.Error())
+		}
+		if strings.Contains(err.Error(), "Missing API key") {
+			t.Fatalf("error=%q must not echo the provider-controlled message", err.Error())
+		}
+	})
+}
+
+// TestOpenCodeGoContractFixturesAreSecretFree asserts the committed opencode-go
+// fixture files contain no bearer tokens, account IDs, or key/value secrets.
+func TestOpenCodeGoContractFixturesAreSecretFree(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "quota", "opencode-go"))
+	if err != nil {
+		t.Fatalf("read fixture dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		body := loadOpenCodeGoFixture(t, e.Name())
+		if secretPattern.MatchString(string(body)) {
+			t.Fatalf("fixture %s contains a secret pattern", e.Name())
+		}
+	}
+}
+
 // --- z.ai adapter fixture acceptance -------------------------------------
 //
 // These acceptance tests load the sanitized z.ai fixture files from the
@@ -927,6 +1090,79 @@ func TestNeuralwattContractFixtureIsSecretFree(t *testing.T) {
 	body := loadNeuralwattFixture(t)
 	if secretPattern.MatchString(string(body)) {
 		t.Fatal("Neuralwatt fixture contains a secret pattern")
+	}
+}
+
+// --- Antigravity adapter fixture acceptance ---------------------------------
+//
+// These replay the synthetic agy /quota fixtures through the real adapter via
+// a fake runner; no process is spawned.
+
+type antigravityFixtureRunner struct{ out []byte }
+
+func (antigravityFixtureRunner) LookPath(name string) (string, error) {
+	return "/synthetic/bin/" + name, nil
+}
+
+func (r antigravityFixtureRunner) Run(context.Context, string, []string, []string) ([]byte, error) {
+	return r.out, nil
+}
+
+func fetchAntigravityFixture(t *testing.T, name string) (quota.QuotaSnapshot, error) {
+	t.Helper()
+	path := filepath.Join("testdata", "quota", "antigravity", name)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", path, err)
+	}
+	reg := quota.NewEvidenceRegistry()
+	reg.Register(quota.AntigravityEvidence(contractNow))
+	src := quota.NewAntigravitySource("antigravity-fixture", antigravityFixtureRunner{out: b}, reg, contractNow)
+	src.TempDir = t.TempDir()
+	return src.Fetch(context.Background())
+}
+
+func TestAntigravityContractFixtures(t *testing.T) {
+	t.Run("quota", func(t *testing.T) {
+		snap, err := fetchAntigravityFixture(t, "quota.json")
+		if err != nil || snap.Status != quota.SourceFresh || snap.Availability != quota.QuotaAvailable || len(snap.Windows) != 2 {
+			t.Fatalf("snap=%+v err=%v", snap, err)
+		}
+		fiveHour := contractFindWindow(snap.Windows, "gemini_5h")
+		weekly := contractFindWindow(snap.Windows, "gemini_weekly")
+		if fiveHour == nil || fiveHour.Period == nil || *fiveHour.Period != 5*time.Hour || math.Abs(*fiveHour.UsagePercent-25) > 1e-9 {
+			t.Fatalf("gemini_5h=%+v", fiveHour)
+		}
+		if weekly == nil || weekly.Period == nil || *weekly.Period != 7*24*time.Hour || math.Abs(*weekly.UsagePercent-60) > 1e-9 ||
+			weekly.ResetAt == nil || !weekly.ResetAt.Equal(time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)) {
+			t.Fatalf("gemini_weekly=%+v", weekly)
+		}
+	})
+	t.Run("disabled_bucket", func(t *testing.T) {
+		snap, err := fetchAntigravityFixture(t, "disabled_bucket.json")
+		if err != nil || len(snap.Windows) != 1 || snap.Windows[0].Name != "gemini_weekly" || snap.Availability != quota.QuotaAvailable {
+			t.Fatalf("snap=%+v err=%v", snap, err)
+		}
+	})
+	for _, name := range []string{"no_gemini.json", "wrong_command.json"} {
+		t.Run(name, func(t *testing.T) {
+			snap, err := fetchAntigravityFixture(t, name)
+			if err == nil || snap.Status != quota.SourceFailed {
+				t.Fatalf("snap=%+v err=%v; want fail closed", snap, err)
+			}
+		})
+	}
+}
+
+func TestAntigravityContractFixturesAreSecretFree(t *testing.T) {
+	for _, name := range []string{"quota.json", "no_gemini.json", "wrong_command.json", "disabled_bucket.json"} {
+		b, err := os.ReadFile(filepath.Join("testdata", "quota", "antigravity", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if secretPattern.MatchString(string(b)) {
+			t.Fatalf("Antigravity fixture %s contains a secret pattern", name)
+		}
 	}
 }
 

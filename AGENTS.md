@@ -1,8 +1,8 @@
 # AGENTS.md — polytoken-quota reconciler
 
-Last verified: 2026-09-18
+Last verified: 2026-09-20
 
-Task-assessment/selection contracts live in `internal/selection/AGENTS.md`. Operator opt-in remote assessment is a runtime feature, not an exception to repository agents' no-live-accounts validation rule.
+Task-assessment/selection contracts live in `internal/selection/AGENTS.md`. Selection domain vocabulary is defined in the committed `CONTEXT.md`, with the public selection contract in `docs/selection.md`; unlike the ignored design/plan artifacts below, both are committed repository files. Operator opt-in remote assessment is a runtime feature, not an exception to repository agents' no-live-accounts validation rule.
 
 Short-lived Go CLI (`polytoken-quota`) that maintains durable independent
 quota/availability state and safely reconciles only
@@ -21,10 +21,13 @@ Approved plan: `docs/superpowers/polytoken-quota-reconciler/plan.md`
 - **Module path:** `github.com/geofffranks/polytoken-quota`
 - **Supported targets (GOOS/GOARCH):** `darwin/arm64`, `darwin/amd64`,
   `linux/amd64`, `linux/arm64`
-- **Polytoken contract binary:** resolved from `PATH` (currently
-  `0.6.6`), overridable via `POLYTOKEN_BINARY`.
-  Version policy: minimum-current — keep the supported binary at the latest stable
-  release.
+- **Polytoken contract binary:** the opt-in contract suite resolves it from
+  `POLYTOKEN_CONTRACT_BIN` (or `POLYTOKEN_BIN`) and does not fall back to `PATH`.
+  No release number is pinned: the suite pins behavior, and a contract that needs
+  a specific surface asserts that surface directly (see
+  `requireDaemonCapabilities` in `contract/daemon_reload_test.go`).
+  Separately, `select`/`select-eval` resolve their `polytoken` prerequisite from
+  `PATH`, overridable via `POLYTOKEN_BINARY`.
 
 ## Install / release convention
 
@@ -59,7 +62,7 @@ Repository settings required for these workflows: enable **Allow auto-merge**; s
 | Workflow policy | `scripts/test-workflows.sh` |
 | Contract | `scripts/test-contract.sh` (opt-in external binary) |
 
-Contract tests invoke the real Polytoken binary against complete private staging roots; they are opt-in and never run as part of the default `go test ./...`. They require `POLYTOKEN_BINARY` or a `polytoken` binary on `PATH`, and they must not target live configuration.
+Contract tests invoke the real Polytoken binary against complete private staging roots; they are opt-in and never run as part of the default `go test ./...`. They require `POLYTOKEN_CONTRACT_BIN` (or `POLYTOKEN_BIN`) to name an executable supported Polytoken binary, and they must not target live configuration.
 
 ## Artifact policy
 
@@ -77,9 +80,10 @@ Contract tests invoke the real Polytoken binary against complete private staging
   credentials, auth blocks, inherited secrets, or raw unrelated config. Sanitize all
   diagnostics and command output. Transient staging is the sole narrowly scoped
   exception and must be private and always deleted.
-- **Scoped daemon interaction.** The host binary (`check`, `reconcile`,
-  `init`, `routing`, `state`) never contacts, inspects, or signals any live
-  Polytoken daemon or session. The sole exception is the operator-installed
+- **Scoped daemon interaction.** The host binary (`init`, `status`, `check`,
+  `reconcile`, `routing`, `doctor`, `history`, `select`, `select-eval`,
+  `install-hook`) never contacts, inspects, or signals any live Polytoken
+  daemon or session. The sole exception is the operator-installed
   `notice-hook` subcommand: it acts only on its **own** session's daemon, via
   the documented loopback HTTP API, with that session's own credential, and
   only between turns (a 409 turn-in-flight reply is skipped, never forced).

@@ -17,6 +17,121 @@ global:
   full: [codex/gpt-5]
 ```
 
+## Policy modes: legacy and provider-only
+
+The `mode` key selects the policy grammar. It is optional:
+
+- **Legacy** (no `mode` key, or `mode: legacy`): the full grammar documented on
+  this page — provider mappings enumerate concrete `models`, targets carry
+  desired chains (`full`/`mini`/`nano`/`classifier`) and `definitions`, and
+  quota may reorder chains when `routing` is enabled.
+
+  One legacy exception: when the target's configuration uses `modelgroups` — a
+  top-level `modelgroups` key in the global `config.yaml` or any registered
+  project layer's `config.yaml` — Polytoken rejects any candidate that combines
+  a legacy tier default with an explicit model-group definition. Reconcile then
+  leaves the tier defaults (`defaults.full`/`mini`/`nano` and the classifier
+  pin, including routing-driven reorders of them) unwritten and operator-owned,
+  reporting each skipped field under `reconcile --verbose`;
+  `models.*.enabled` and facet/subagent fields are still managed. A
+  configuration without `modelgroups` anywhere is written exactly as before.
+- **`mode: provider-only`** (strictly opt-in): quota tracks enrolled Polytoken
+  provider IDs and never edits models, chains, or definitions. Every other key
+  on this page keeps its legacy meaning.
+
+```yaml
+version: 1
+mode: provider-only
+providers:
+  codex:
+    quota:
+      adapter: codex
+  team-llm: {}
+global:
+  root: /home/user/.config/polytoken
+operational:
+  notice_path: /shared/polytoken-quota/notice.json
+```
+
+In this mode, provider IDs are the unit of quota gating. During reserve or
+exhausted/disabled quota, reconciliation disables the enrolled provider; when
+quota returns to normal it restores only the exact baseline it previously
+recorded and owned. It does not edit `modelgroups`, tier defaults, model enable
+flags, or facet/subagent assignments, and it cannot promise which remaining
+model Polytoken will serve. Group composition follows Polytoken's observed
+behavior: same-name global leaves precede project leaves, with duplicate leaves
+retained in their authored positions.
+
+### Provider-only grammar
+
+- `providers.<id>` enrolls the Polytoken provider ID `<id>`. IDs are enrolled
+  verbatim — they do not need to name a quota adapter. A mapping may be empty
+  (`id: {}`): the provider is visible in diagnostics but never polled.
+- `providers.<id>.quota` optionally attaches quota polling. Unlike legacy
+  mode, the quota block must name its adapter explicitly with `quota.adapter`
+  (one of the built-in adapter names). The Anthropic rules carry over:
+  `adapter: anthropic` requires `monthly_budget_usd` unless
+  `mode: subscription` is set, and `adapter: anthropic-subscription` is always
+  subscription mode (no budget, no `mode` key).
+- `global.root` is required: it is the single configuration root the
+  provider-only policy targets.
+- `projects` entries register additional roots with exactly `id` and `root` —
+  the same registration grammar as legacy mode, and a first-class part of the
+  provider-only safety model: the gate's analyzer evaluates every registered
+  global+project root, and a project-layer modelgroup leaf can keep a group
+  usable when all global leaves for it are gated off. Legacy project FIELDS are
+  rejected in provider-only mode: a project entry carrying anything beyond
+  `id` and `root` (for example `full`/`mini`/`nano`/`classifier` chains or
+  `definitions`) fails to load.
+- Legacy fields are **rejected** in provider-only mode, and the file fails to
+  load: `models` under a provider, `full`/`mini`/`nano`/`classifier` chains and
+  `definitions` on a target, and the top-level `routing` and `selection`
+  sections. A mixed legacy/provider-only file never half-converts
+  an installation.
+- `operational` behaves exactly as in legacy mode.
+
+### Provider-only command support
+
+| Command | Provider-only behavior |
+|---|---|
+| `init --provider-only [--force]` | Create (or, with `--force`, replace) the policy enrolling the live global provider IDs. Never adopts model groups, models, chains, or definitions. |
+| `init --provider-only --preview` | Read-only migration preview (see below). |
+| `status` | Provider-level status with `provider_only: true`; route/chain sections are empty by design and the text view says so. |
+| `check` | Polls enrolled, adapter-configured providers as usual. |
+| `check --reconcile` | Poll and apply provider-only gating to enrolled global providers after the safety analyzer and staged validation pass. |
+| `reconcile` | Apply provider-only gating without polling; provider state comes from the latest saved evidence. Supports `--dry-run`, `--keep-staging` (dry-run only), and `--verbose`. |
+| `routing enable/disable/reset` | Unsupported: chain-based routing is legacy behavior and a provider-only policy rejects the `routing` section. |
+| `doctor` | Maintained: policy schema, state, publication/journal, and quota findings work; no chain findings exist. |
+| `history` | Maintained: state history is independent of the policy mode. |
+| `select`, `select-eval` | Unsupported: model selection projects managed chains, which a provider-only policy does not define. |
+| `install-hook` / `notice-hook` | Maintained: hook installation and the notice path are mode-independent. |
+
+### Migrating a legacy policy to provider-only mode
+
+`init --provider-only --force` over an existing legacy policy is a migration:
+
+- The operator-authored `operational` section (timeouts, notice path,
+  `on_change` actions, backup retention) is carried into the new policy.
+- The replaced legacy policy file is preserved at
+  `desired.yaml.before-provider-only` next to the original.
+- The migration preview — printed by the command, and available in advance
+  via `init --provider-only --preview` — reports:
+  - the provider IDs the new policy enrolls and the global root it targets;
+  - every legacy quota-authored edit that **persists as operator-owned**:
+    previously managed `defaults.full`/`mini`/`nano`/`classifier` chains,
+    definition chains, and `models.*` enablement stay in your Polytoken
+    configuration exactly as quota left them. Provider-only quota never
+    removes or rewrites those edits; they are yours to change or revert.
+  - the managed-file backup root and apply journal paths (with whether files
+    exist there yet) and the preserved policy path;
+  - rollback guidance (restore the preserved policy file, or restore a
+    managed-file backup, and rerun `init` without `--provider-only`).
+- The migration only replaces the quota policy file. Polytoken configuration
+  bytes are never touched.
+
+A plain legacy `init --force` over a provider-only policy is rejected: leaving
+provider-only mode is a deliberate migration, never a side effect.
+
 ## `version`
 
 Required. Currently `1`. A missing or different version is rejected at load.
@@ -33,6 +148,8 @@ block, the key must also name a built-in quota adapter:
 | `zai` | Z.ai allowance polling |
 | `anthropic` | Anthropic Admin API spend against `monthly_budget_usd` |
 | `neuralwatt` | Neuralwatt Cloud quota endpoint |
+| `opencode-go` | OpenCode Go usage-window polling (`OPENCODE_GO_API_KEY`, else OpenCode's `auth.json`) |
+| `antigravity` | Gemini quota group from the logged-in `agy` CLI (`agy -p /quota`) |
 
 A quota block under any other key is rejected at load with the valid names.
 Supported non-Anthropic mappings may omit `quota` or use `quota: {}`; both forms
@@ -42,6 +159,14 @@ pollable only with a positive `monthly_budget_usd`. Unknown/manual mappings
 without a supported quota adapter may use any key; they keep their configured
 chain positions and are visible in diagnostics but are never quota-ranked or
 polled.
+
+Provider note: `opencode-go` reports percentages rather than dollars, so it needs
+no `monthly_budget_usd` and may omit `quota` or use `quota: {}`. Its credential is
+the transient `OPENCODE_GO_API_KEY`; when that variable is unresolved the adapter
+fails closed and makes no HTTP request. It polls three windows (`rolling`,
+`weekly`, `monthly`) and is subject to the same fail-closed evidence gate as every
+other adapter. See the
+[OpenCode Go adapter](../README.md#opencode-go-adapter) section of the README.
 
 ### `models`
 
@@ -69,7 +194,7 @@ There is no `adapter` field; the mapping key selects the adapter.
 | `monthly_budget_usd` | none | Required and positive for `anthropic` in `api` mode: the monthly spend ceiling treated as that provider's quota. Unused by the other adapters and forbidden in `subscription` mode. |
 | `freshness_ttl` | `30m` | How long a successful snapshot stays eligible for ranking. Raise it if you check less often than every 30 minutes. |
 | `balance_group` | `default` | Providers are only ranked against others in the same group. Use to keep, say, a paid and a free provider from competing. |
-| `weight` | `1` | Global tie-break between providers otherwise ranked equal. Higher wins. When pace, schedule, and weight are all equal, providers share a routing rank and each route keeps its authored chain order. Pace is compared only when every eligible provider in the balance group can compute it. |
+| `weight` | `1` | Global tie-break between providers otherwise ranked equal. Higher wins. When signal cluster, schedule, and weight are all equal, providers share a routing rank and each route keeps its authored chain order. The signal is compared only when every eligible provider in the balance group can compute it. |
 | `schedule` | none (never off-peak) | Off-peak windows for ranking; see below. |
 
 ### `schedule`
@@ -117,6 +242,27 @@ Only the runtime process environment's `TYPESAFE_API_KEY` supplies the credentia
 `projects` registers an additional target. A project root is never
 discovered or adopted unless it is listed.
 
+In provider-only mode `projects` entries carry exactly `id` and `root`:
+
+```yaml
+version: 1
+mode: provider-only
+providers:
+  codex: {}
+global:
+  root: /home/user/.config/polytoken
+projects:
+  - id: web-app
+    root: /home/user/src/web-app
+  - id: cli-tool
+    root: /home/user/src/cli-tool/.polytoken
+```
+
+Each registered root gives the provider-only gate's safety analyzer the
+project-layer modelgroup leaves and facet/subagent references it needs to
+prove a disable safe; register every root whose project layers carry
+modelgroup or definition content.
+
 | Field | Set it | Meaning |
 |-------|-------|---------|
 | `root` | always | Configuration root for the target. The global root is the Polytoken configuration directory (for example `~/.config/polytoken`). A project root may be the project directory: when the root itself holds no `config.yaml`, its `.polytoken` subdirectory is used as the configuration root automatically. A root with neither is rejected with a clear error. |
@@ -158,7 +304,7 @@ valid.
 | `validation_timeout` | `30s` | Budget for validating a staged reconcile candidate. |
 | `lock_wait` | `10s` | How long to wait for the state mutation lock. |
 | `recovered_retention` | `168h` | How long recovered-error history is kept. |
-| `backup_count` | `5` | State backups retained. Must be at least 1. |
+| `backup_count` | `1` | Per-file pre-apply backups of managed files retained. Default 1; minimum 1; pruned oldest-first as files change. |
 | `notice_path` | `~/.local/polytoken-quota/notice.json` | Where the reconciliation notice is published. The path must be visible inside agent containers for the in-session hook to converge (bind-mount it at the same path, or point it at an already-shared location). |
 | `on_change` | none | Opt-in host-side actions run after a committed revision changed managed fields (see below). |
 
@@ -200,6 +346,23 @@ nothing executes.
 The same JSON document is used for the notice file and as the `stdin` payload
 for every `on_change` action. There is no additional envelope. A representative
 payload is:
+
+Provider-only policies publish a provider status document instead of model or
+route projections:
+
+```json
+{
+  "schema": 1,
+  "revision": 43,
+  "provider_only": true,
+  "providers": [{"id": "codex", "enabled": false}]
+}
+```
+
+It is published only after a committed provider-field change; conflict, failed
+validation, recovery without a new edit, and no-edit reconciliation do not
+produce a change notice. The existing schema-v1 route payload below is retained
+for legacy policies.
 
 ```json
 {

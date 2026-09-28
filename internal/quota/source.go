@@ -316,6 +316,24 @@ var builtInAdapters = []AdapterDefinition{
 			return NewNeuralwattSource(id, client, creds, reg, now)
 		},
 	},
+	{
+		Name:     opencodeGoProviderName,
+		Evidence: OpenCodeGoEvidence,
+		// Percent-based quota needs no user budget; the budget parameter is deliberately unused,
+		// mirroring neuralwatt.
+		New: func(id string, client *BoundedClient, creds CredentialResolver, _ float64, reg *EvidenceRegistry, now time.Time) QuotaSource {
+			return NewOpenCodeGoSource(id, client, creds, reg, now)
+		},
+	},
+	{
+		Name:     antigravityProviderName,
+		Evidence: AntigravityEvidence,
+		// The Antigravity source runs the vendor agy CLI with its own login;
+		// the HTTP client, creds, and budget parameters are deliberately unused.
+		New: func(id string, _ *BoundedClient, _ CredentialResolver, _ float64, reg *EvidenceRegistry, now time.Time) QuotaSource {
+			return NewAntigravitySource(id, nil, reg, now)
+		},
+	},
 }
 
 // AdapterDefinitions returns the built-in adapter definitions in stable name

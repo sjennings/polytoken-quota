@@ -70,6 +70,18 @@ type Target struct {
 	Mini        Chain
 	Nano        Chain
 	Classifier  Chain
+
+	// UsesModelGroups records that the target's composed config surface — the
+	// live global config.yaml or any registered project layer's config.yaml —
+	// defines a top-level modelgroups key. It is not authored in desired.yaml:
+	// the service coordinator detects it on the registered roots before every
+	// legacy transaction and stamps it here (see service detectModelGroups).
+	// Polytoken rejects a version-4 config that combines a legacy tier default
+	// with an explicit model-group definition, and the staged merge composes
+	// the layers, so a stamped target's tier-default fields stay
+	// operator-owned: the reconciler proposes no defaults edits for it and
+	// reports the skipped fields on the plan.
+	UsesModelGroups bool
 }
 
 // OnChange bounds for operator-configured host-side actions. The count and
@@ -114,7 +126,8 @@ type Operational struct {
 // FreshnessTTL 30m, BalanceGroup "default", Weight 1 when zero/empty.
 type QuotaConfig struct {
 	// Adapter is the quota adapter name ("codex" | "zai" | "anthropic" |
-	// "anthropic-subscription" | "neuralwatt"). It is not user-configurable:
+	// "anthropic-subscription" | "neuralwatt" | "opencode-go" | "antigravity").
+	// It is not user-configurable:
 	// Load derives it from the provider mapping key (and, for anthropic, the
 	// quota `mode` — `subscription` selects the anthropic-subscription
 	// adapter) and validates it is a known adapter.
@@ -149,7 +162,17 @@ const DocumentedJevModel = "jev-1.13.0"
 // DefaultJevTimeout bounds one JEV assessment when selection.jev omits
 // timeout. It must stay positive: Load rejects an explicit non-positive
 // timeout, so every resolved JevSelectionConfig carries a positive bound.
+// It is the single source of that bound; the selection package's
+// DefaultAssessTimeout delegates to it, so the two layers cannot drift.
 const DefaultJevTimeout = 10 * time.Second
+
+// DefaultQuotaFreshness is the freshness TTL a quota mapping must satisfy
+// when its configuration omits freshness_ttl. It matches the routing
+// package's default and is the single source of that bound: Load applies it
+// here, and the selection package falls back to it for mappings whose
+// configured TTL is non-positive, so one documented value governs every
+// freshness decision.
+const DefaultQuotaFreshness = 30 * time.Minute
 
 // SelectionConfig holds quota-aware model-selection settings (additive on
 // Desired). The whole section is optional: Load resolves an omitted selection
@@ -181,6 +204,34 @@ type JevSelectionConfig struct {
 	Timeout time.Duration
 }
 
+// PolicyMode names the desired.yaml policy mode. The zero value (and the
+// explicit "legacy" spelling) is the original chain-managing policy: provider
+// mappings enumerate concrete models and targets carry desired chains and
+// definitions. ModeProviderOnly is the strictly opt-in provider-only policy: it
+// enrolls Polytoken provider IDs with optional quota adapter configuration and
+// a global target, and rejects every legacy target/model field.
+type PolicyMode string
+
+const (
+	// ModeLegacy is the original policy mode. desired.yaml files without a
+	// mode key load as ModeLegacy; the explicit spelling is accepted so a
+	// legacy policy can document its mode.
+	ModeLegacy PolicyMode = "legacy"
+	// ModeProviderOnly selects the provider-only policy: enrolled Polytoken
+	// provider IDs, optional per-provider quota adapter configuration, a
+	// global target, and registered project roots (id and root only) for
+	// read-only safety assessment. Model enumeration, chain definitions, and
+	// the routing/selection sections are rejected in this mode, as is any
+	// project field beyond id and root.
+	ModeProviderOnly PolicyMode = "provider-only"
+)
+
+// ProviderOnly reports whether the policy is the opt-in provider-only mode.
+// Callers branch explicitly on this — a provider-only Desired carries no model
+// enumeration or chains, so any legacy chain projection over it would be a
+// silent no-op by accident.
+func (d Desired) ProviderOnly() bool { return d.Mode == ModeProviderOnly }
+
 // Desired is the fully validated in-memory desired policy produced by Load.
 type Desired struct {
 	Version     int
@@ -188,6 +239,13 @@ type Desired struct {
 	Global      Target
 	Projects    []Target
 	Operational Operational
+
+	// Mode records the policy mode. In ModeProviderOnly the Providers map
+	// carries the enrolled Polytoken provider IDs (Models is nil, Quota holds
+	// the explicit quota adapter configuration when enrolled with one), Global
+	// carries only the target identity and root, and Projects carries only the
+	// registered project identity and root for each entry.
+	Mode PolicyMode
 
 	// Routing holds the top-level routing enablement. Load defaults it to
 	// enabled when the routing section is omitted; explicit
